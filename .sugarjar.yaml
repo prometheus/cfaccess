@@ -1,0 +1,13 @@
+on_push: [lint]
+lint:
+  - name: yamllint
+    command: yamllint .
+  - name: golangci-lint
+    command: golangci-lint
+  - name: vet
+    command: go vet
+  - name: style
+    command: make style
+unit:
+  - name: unit
+    command: make test
