@@ -118,6 +118,9 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := req.Context().Err(); err != nil {
 		return nil, err
 	}
+	if req.URL.Scheme != "https" {
+		return nil, fmt.Errorf("cloudflare access: HTTPS is required")
+	}
 
 	key := req.URL.Scheme + "://" + req.URL.Host
 	tok, err := rt.appFor(key).fetch(req.URL, rt.deps)
