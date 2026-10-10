@@ -305,6 +305,33 @@ func TestRoundTripperDoesNotAuthenticateCancelledRequest(t *testing.T) {
 	require.True(t, body.closed.Load())
 }
 
+func TestRoundTripperRejectsHTTPBeforeAuthentication(t *testing.T) {
+	t.Parallel()
+
+	deps := testDependencies(t,
+		time.Now,
+		func(*url.URL) (*token.AppInfo, error) {
+			t.Fatal("GetAppInfo must not receive an HTTP request")
+			return nil, nil
+		},
+		func(*url.URL, *token.AppInfo) (string, error) {
+			t.Fatal("FetchToken must not receive an HTTP request")
+			return "", nil
+		},
+	)
+	rt := newRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("next RoundTripper must not receive an HTTP request")
+		return nil, nil
+	}), deps)
+	body := &closeTrackingBody{}
+	req, err := http.NewRequest(http.MethodGet, "http://app.example.com/query", body)
+	require.NoError(t, err)
+
+	_, err = rt.RoundTrip(req)
+	require.ErrorContains(t, err, "HTTPS is required")
+	require.True(t, body.closed.Load())
+}
+
 type closeIdleRoundTripper struct {
 	closed atomic.Bool
 }
