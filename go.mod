@@ -6,7 +6,7 @@ require (
 	github.com/cloudflare/cloudflared v0.0.0-20260306125340-d2a87e9b9345
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/common v0.71.0
-	github.com/rs/zerolog v1.20.0
+	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.12.1
 )
 
@@ -19,6 +19,8 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f // indirect
