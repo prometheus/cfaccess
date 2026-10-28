@@ -4,11 +4,11 @@
 
 `cfaccess` provides an `http.RoundTripper` that authenticates requests to
 applications protected by [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/).
-It uses cloudflared's browser-based login flow and stores tokens in cloudflared's
-normal on-disk cache.
+It implements Cloudflare's browser-based login flow and shares cloudflared's
+normal on-disk token cache, without depending on cloudflared.
 
 This is a separate module from `github.com/prometheus/common` so that projects
-which do not use Cloudflare Access do not inherit cloudflared's dependency tree.
+which do not use Cloudflare Access do not inherit its authentication code.
 
 This module is considered internal to Prometheus, without any stability
 guarantees for external usage.
@@ -59,7 +59,13 @@ If no valid token is cached, the first request opens the user's browser and
 blocks until login completes. This behavior is intended for interactive tools,
 not unattended servers.
 
-Cloudflared's token APIs do not currently accept a `context.Context`, so
-cancelling the original request cannot interrupt an authentication operation
-already in progress. The authenticated request is not sent if its context has
-expired by the time authentication completes.
+Cancelling the request interrupts authentication HTTP requests and waits for
+in-process or on-disk cache locks. It does not close an already opened browser.
+The authenticated request is not sent if its context has expired.
+
+Cache locks coordinate interactive logins across processes. An abandoned lock
+causes a bounded wait followed by an error identifying the lock file. Remove
+that file only after checking that no other login is still running.
+
+The private [token implementation](internal/token/README.md) documents the
+upstream protocol source and compatibility details.

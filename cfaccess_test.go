@@ -25,10 +25,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudflare/cloudflared/token"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/cfaccess/internal/token"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -67,14 +67,12 @@ func testDependencies(
 	fetchToken func(*url.URL, *token.AppInfo) (string, error),
 ) dependencies {
 	t.Helper()
-	logger := zerolog.Nop()
 	return dependencies{
 		now:        now,
-		getAppInfo: getAppInfo,
-		fetchToken: func(appURL *url.URL, info *token.AppInfo, _ *zerolog.Logger) (string, error) {
+		getAppInfo: func(_ context.Context, u *url.URL) (*token.AppInfo, error) { return getAppInfo(u) },
+		fetchToken: func(_ context.Context, appURL *url.URL, info *token.AppInfo) (string, error) {
 			return fetchToken(appURL, info)
 		},
-		logger: &logger,
 	}
 }
 
@@ -120,7 +118,7 @@ func TestRoundTripper(t *testing.T) {
 		},
 		func(appURL *url.URL, _ *token.AppInfo) (string, error) {
 			require.Equal(t, "/query", appURL.Path)
-			// cloudflared constructs the login endpoint by mutating this URL.
+			// Login constructs the login endpoint by mutating this URL.
 			appURL.Path = "/cdn-cgi/access/cli"
 			appURL.RawQuery = "token=secret"
 			if fetchTokenCalls.Add(1) == 1 {
@@ -358,4 +356,80 @@ func TestNewRoundTripperDefaultsTransport(t *testing.T) {
 
 	rt := NewRoundTripper(nil).(*roundTripper)
 	require.Same(t, http.DefaultTransport, rt.next)
+}
+
+func TestRoundTripperCancelsAuthentication(t *testing.T) {
+	t.Parallel()
+	for _, stage := range []string{"discovery", "login"} {
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			started := make(chan struct{})
+			deps := dependencies{
+				now: time.Now,
+				getAppInfo: func(ctx context.Context, _ *url.URL) (*token.AppInfo, error) {
+					if stage == "discovery" {
+						close(started)
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					return &token.AppInfo{}, nil
+				},
+				fetchToken: func(ctx context.Context, _ *url.URL, _ *token.AppInfo) (string, error) {
+					close(started)
+					<-ctx.Done()
+					return "", ctx.Err()
+				},
+			}
+			next := roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("downstream must not be called")
+			})
+			rt := newRoundTripper(next, deps)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			body := &closeTrackingBody{}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://app.example/query", body)
+			require.NoError(t, err)
+			result := make(chan error, 1)
+			go func() { _, err := rt.RoundTrip(req); result <- err }()
+			<-started
+			cancel()
+			require.ErrorIs(t, <-result, context.Canceled)
+			require.True(t, body.closed.Load())
+		})
+	}
+	t.Run("waiting for another request", func(t *testing.T) {
+		t.Parallel()
+		started := make(chan struct{})
+		deps := dependencies{
+			now:        time.Now,
+			getAppInfo: func(context.Context, *url.URL) (*token.AppInfo, error) { return &token.AppInfo{}, nil },
+			fetchToken: func(ctx context.Context, _ *url.URL, _ *token.AppInfo) (string, error) {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		}
+		rt := newRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("downstream must not be called")
+		}), deps)
+		firstCtx, cancelFirst := context.WithCancel(t.Context())
+		defer cancelFirst()
+		first, err := http.NewRequestWithContext(firstCtx, http.MethodGet, "https://app.example/query", http.NoBody)
+		require.NoError(t, err)
+		done := make(chan error, 1)
+		go func() { _, err := rt.RoundTrip(first); done <- err }()
+		<-started
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
+		body := &closeTrackingBody{}
+		second, err := http.NewRequestWithContext(ctx, http.MethodGet, first.URL.String(), body)
+		require.NoError(t, err)
+		_, err = rt.RoundTrip(second)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.True(t, body.closed.Load())
+		// Cancelling the waiter must not interrupt the request performing login.
+		require.NoError(t, firstCtx.Err())
+		cancelFirst()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
 }

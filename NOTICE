@@ -1,2 +1,6 @@
 Cloudflare Access authentication for Prometheus Go components.
-Copyright 2026 The Prometheus Authors
+Copyright The Prometheus Authors
+
+The Access token protocol implementation in internal/token is adapted from
+cloudflare/cloudflared, commit d2a87e9b9345, by Cloudflare and its contributors,
+available under the Apache License, Version 2.0.
