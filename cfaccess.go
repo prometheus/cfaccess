@@ -16,16 +16,16 @@
 package cfaccess
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
-	"github.com/cloudflare/cloudflared/token"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/rs/zerolog"
+
+	"github.com/prometheus/cfaccess/internal/token"
 )
 
 const (
@@ -36,17 +36,14 @@ const (
 	tokenExpiryMargin = 30 * time.Second
 )
 
-var initializeCloudflared sync.Once
-
 type dependencies struct {
-	getAppInfo func(*url.URL) (*token.AppInfo, error)
-	fetchToken func(*url.URL, *token.AppInfo, *zerolog.Logger) (string, error)
+	getAppInfo func(context.Context, *url.URL) (*token.AppInfo, error)
+	fetchToken func(context.Context, *url.URL, *token.AppInfo) (string, error)
 	now        func() time.Time
-	logger     *zerolog.Logger
 }
 
 type app struct {
-	mtx     sync.Mutex
+	gate    chan struct{}
 	info    *token.AppInfo
 	token   string
 	expires time.Time
@@ -64,23 +61,15 @@ type roundTripper struct {
 // token for each target application and adds it to requests before passing
 // them to next. If next is nil, http.DefaultTransport is used.
 func NewRoundTripper(next http.RoundTripper) http.RoundTripper {
-	initializeCloudflared.Do(func() {
-		// cloudflared stores its User-Agent globally, so use one stable identity
-		// rather than allowing constructors to race with per-consumer values.
-		token.Init("prometheus-cfaccess")
-	})
 	if next == nil {
 		next = http.DefaultTransport
 	}
 
-	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: "15:04:05"}).With().Timestamp().Logger()
+	client := token.NewClient()
 	return newRoundTripper(next, dependencies{
-		getAppInfo: token.GetAppInfo,
-		fetchToken: func(appURL *url.URL, info *token.AppInfo, logger *zerolog.Logger) (string, error) {
-			return token.FetchToken(appURL, info, false, false, logger)
-		},
-		now:    time.Now,
-		logger: &logger,
+		getAppInfo: client.GetAppInfo,
+		fetchToken: client.FetchToken,
+		now:        time.Now,
 	})
 }
 
@@ -98,7 +87,7 @@ func (rt *roundTripper) appFor(key string) *app {
 
 	a, ok := rt.apps[key]
 	if !ok {
-		a = &app{}
+		a = &app{gate: make(chan struct{}, 1)}
 		rt.apps[key] = a
 	}
 	return a
@@ -123,7 +112,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	key := req.URL.Scheme + "://" + req.URL.Host
-	tok, err := rt.appFor(key).fetch(req.URL, rt.deps)
+	tok, err := rt.appFor(key).fetch(req.Context(), req.URL, rt.deps)
 	if err != nil {
 		return nil, fmt.Errorf("cloudflare access: %w", err)
 	}
@@ -146,20 +135,26 @@ func (rt *roundTripper) CloseIdleConnections() {
 	}
 }
 
-func (a *app) fetch(requestURL *url.URL, deps dependencies) (string, error) {
-	a.mtx.Lock()
-	defer a.mtx.Unlock()
+func (a *app) fetch(ctx context.Context, requestURL *url.URL, deps dependencies) (string, error) {
+	select {
+	case a.gate <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-a.gate }()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	if a.token != "" && deps.now().Add(tokenExpiryMargin).Before(a.expires) {
 		return a.token, nil
 	}
 
 	if a.info == nil {
-		// Cloudflared may retain or modify URLs passed to its APIs. Give each
-		// operation its own copy so neither it nor the request can affect the
-		// other.
+		// Give discovery and login their own URL copies so neither operation
+		// can affect the request or the other operation.
 		discoveryURL := *requestURL
-		info, err := deps.getAppInfo(&discoveryURL)
+		info, err := deps.getAppInfo(ctx, &discoveryURL)
 		if err != nil {
 			return "", fmt.Errorf("failed to detect Cloudflare Access application for %s://%s: %w", requestURL.Scheme, requestURL.Host, err)
 		}
@@ -167,7 +162,7 @@ func (a *app) fetch(requestURL *url.URL, deps dependencies) (string, error) {
 	}
 
 	loginURL := *requestURL
-	tok, err := deps.fetchToken(&loginURL, a.info, deps.logger)
+	tok, err := deps.fetchToken(ctx, &loginURL, a.info)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch Cloudflare Access token: %w", err)
 	}
@@ -178,7 +173,7 @@ func (a *app) fetch(requestURL *url.URL, deps dependencies) (string, error) {
 }
 
 // tokenExpiry returns the expiry time encoded in the token's exp claim. The
-// token was obtained directly from cloudflared, so its signature is not
+// token was obtained through the Access login flow, so its signature is not
 // verified here. A token whose expiry cannot be read is refreshed on the next
 // request.
 func tokenExpiry(tok string) time.Time {
